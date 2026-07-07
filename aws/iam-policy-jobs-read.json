@@ -1,0 +1,22 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "ListJobFolders",
+      "Effect": "Allow",
+      "Action": "s3:ListBucket",
+      "Resource": "arn:aws:s3:::revotext-portal-documents",
+      "Condition": {
+        "StringLike": {
+          "s3:prefix": ["jobs/*"]
+        }
+      }
+    },
+    {
+      "Sid": "ReadJobFiles",
+      "Effect": "Allow",
+      "Action": "s3:GetObject",
+      "Resource": "arn:aws:s3:::revotext-portal-documents/jobs/*"
+    }
+  ]
+}

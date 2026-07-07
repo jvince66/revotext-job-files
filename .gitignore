@@ -1,0 +1,27 @@
+# Real secrets — never commit
+**/api/aws-config.json
+**/api/db-config.json
+**/api/users.json
+
+# TLS / crypto material
+*.pem
+*.key
+*.crt
+*.p12
+
+# Editor / OS crud
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+*.swp
+*~
+
+# Composer artifacts (not tracked; deploy step runs composer install)
+**/vendor/
+**/vendor-root/vendor/
+
+# Local scratch
+*.log
+*.tmp
+/tmp/

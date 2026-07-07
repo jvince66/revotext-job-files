@@ -1,0 +1,12 @@
+{
+  "_comment": "Copy to aws-config.json and fill in the IAM values below. NEVER commit the real file.",
+  "region": "us-east-1",
+  "bucket": "revotext-portal-documents",
+  "prefix": "jobs/",
+  "access_key_id":     "<AKIA...>",
+  "secret_access_key": "<40-char-secret>",
+  "presign_ttl_seconds": 900,
+  "job_id_pattern": "/^C-\\d{3}[A-Z0-9]{2}-\\d{3}T?$/",
+
+  "_iam_policy_reference": "aws/iam-policy-jobs-read.json — attach to the IAM user whose keys are used here."
+}
