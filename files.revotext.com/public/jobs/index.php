@@ -101,8 +101,13 @@ let msalInstance = null, account = null;
 function loadMsal() {
   const s = document.createElement('script');
   s.src = 'https://cdn.jsdelivr.net/npm/@azure/msal-browser@2.38.3/lib/msal-browser.min.js';
+  // Subresource Integrity — pins CDN payload to a known SHA-384.
+  // If jsdelivr is compromised or the file is tampered with, browser refuses to execute.
+  // Recompute: curl -s <url> | openssl dgst -sha384 -binary | openssl base64 -A
+  s.integrity = 'sha384-OJTwghM0Gh3Zc+gmd6l0lz1pFw9KuHHq0mSEZgmQEKgMnuSWWDb3bU9KzuD7w2hU';
+  s.crossOrigin = 'anonymous';
   s.onload = initMsal;
-  s.onerror = function () { showError('Failed to load Microsoft sign-in library.'); };
+  s.onerror = function () { showError('Failed to load Microsoft sign-in library or SRI check failed.'); };
   document.head.appendChild(s);
 }
 

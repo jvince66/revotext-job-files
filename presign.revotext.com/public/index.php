@@ -15,6 +15,7 @@
  * Audit hardenings (2026-07-08):
  * - Rate limiter fails CLOSED on filesystem issues
  * - AWS SDK error messages sanitized before echoing to caller (server-side logs full detail)
+ * - Per-IP secondary burst limit (60/min) on top of global 300/min (defense in depth if secret leaks)
  */
 declare(strict_types=1);
 
@@ -89,8 +90,10 @@ if ($token === null || !hash_equals($expectedSecret, $token)) {
 }
 
 // ---- Rate limit: 300/min global, FAIL CLOSED on fs issues ----
+// NOTE: Not /tmp — Apache systemd unit uses PrivateTmp=yes, which would sandbox
+// counters into an unreachable namespace and defeat the cron cleanup.
 $secretHash = substr(hash('sha256', $expectedSecret), 0, 16);
-$rlDir = '/tmp/presign-rl';
+$rlDir = '/var/lib/presign-rl';
 if (!is_dir($rlDir) && !@mkdir($rlDir, 0755, true) && !is_dir($rlDir)) {
     error_log("[presign] rid=$requestId rate limiter dir unavailable: $rlDir");
     fail(503, 'rate limiter unavailable', $requestId);
@@ -114,6 +117,33 @@ fwrite($fp, (string)$count);
 flock($fp, LOCK_UN);
 fclose($fp);
 if ($count > 300) fail(429, 'rate limit exceeded', $requestId);
+
+// ---- Per-IP burst limit: 60/min, FAIL CLOSED ----
+// Server-to-server model = one legit caller IP. Cap per-IP well above expected traffic
+// but low enough that a compromised endpoint secret can't fan out across many IPs unchecked.
+$callerIp = (string)($_SERVER['REMOTE_ADDR'] ?? '0.0.0.0');
+$ipHash = substr(hash('sha256', $callerIp . '|' . $expectedSecret), 0, 16);
+$ipRlFile = $rlDir . '/ip.' . $ipHash . '.' . $minuteBucket;
+$ipFp = @fopen($ipRlFile, 'c+');
+if ($ipFp === false) {
+    error_log("[presign] rid=$requestId per-ip rate limiter fopen failed");
+    fail(503, 'rate limiter unavailable', $requestId);
+}
+if (!flock($ipFp, LOCK_EX)) {
+    fclose($ipFp);
+    error_log("[presign] rid=$requestId per-ip rate limiter flock failed");
+    fail(503, 'rate limiter unavailable', $requestId);
+}
+$ipCount = (int)stream_get_contents($ipFp) + 1;
+ftruncate($ipFp, 0);
+rewind($ipFp);
+fwrite($ipFp, (string)$ipCount);
+flock($ipFp, LOCK_UN);
+fclose($ipFp);
+if ($ipCount > 60) {
+    error_log(sprintf("[presign] rid=%s per-ip rate limit exceeded ip=%s count=%d", $requestId, $callerIp, $ipCount));
+    fail(429, 'rate limit exceeded (ip)', $requestId);
+}
 
 // ---- Config ----
 $region   = (string)($cfg['region']              ?? 'us-east-1');
