@@ -11,6 +11,10 @@
  *
  * Response:
  *   {"uploadUrl":"https://...","expiresIn":900,"key":"jobs/.../","method":"PUT","maxBytes":524288000}
+ *
+ * Audit hardenings (2026-07-08):
+ * - Rate limiter fails CLOSED on filesystem issues
+ * - AWS SDK error messages sanitized before echoing to caller (server-side logs full detail)
  */
 declare(strict_types=1);
 
@@ -27,7 +31,7 @@ if (!is_array($cfg)) {
     exit;
 }
 
-// ---- CORS (still supported in case a browser fallback is ever needed) ----
+// ---- CORS ----
 $allowedOrigin = (string)($cfg['allowed_origin'] ?? '');
 $origin = $_SERVER['HTTP_ORIGIN'] ?? '';
 if ($origin === $allowedOrigin && $allowedOrigin !== '') {
@@ -47,13 +51,19 @@ if ($_SERVER['REQUEST_METHOD'] === 'OPTIONS') {
     exit;
 }
 
-function fail(int $code, string $msg): void {
+// Correlation ID — echoed to caller for support / traceable in server logs
+$requestId = bin2hex(random_bytes(6));
+header('X-Request-Id: ' . $requestId);
+
+function fail(int $code, string $msg, string $requestId = ''): void {
     http_response_code($code);
-    echo json_encode(['error' => $msg]);
+    $body = ['error' => $msg];
+    if ($requestId !== '') $body['request_id'] = $requestId;
+    echo json_encode($body);
     exit;
 }
 
-// ---- Bearer token auth (shared secret) ----
+// ---- Bearer token auth ----
 function get_bearer_token(): ?string {
     $hdr = '';
     if (function_exists('getallheaders')) {
@@ -69,34 +79,41 @@ function get_bearer_token(): ?string {
 }
 
 $expectedSecret = (string)($cfg['endpoint_secret'] ?? '');
-if ($expectedSecret === '' || strlen($expectedSecret) < 32) fail(500, 'server not configured');
+if ($expectedSecret === '' || strlen($expectedSecret) < 32) fail(500, 'server not configured', $requestId);
 
 $token = get_bearer_token();
 if ($token === null || !hash_equals($expectedSecret, $token)) {
-    error_log(sprintf("[presign] unauthorized from ip=%s ua=%s", $_SERVER['REMOTE_ADDR'] ?? '?', $_SERVER['HTTP_USER_AGENT'] ?? '?'));
-    fail(401, 'unauthorized');
+    error_log(sprintf("[presign] rid=%s unauthorized ip=%s ua=%s",
+        $requestId, $_SERVER['REMOTE_ADDR'] ?? '?', $_SERVER['HTTP_USER_AGENT'] ?? '?'));
+    fail(401, 'unauthorized', $requestId);
 }
 
-// ---- Rate limit: 300/min global (keyed by secret hash, not IP) ----
+// ---- Rate limit: 300/min global, FAIL CLOSED on fs issues ----
 $secretHash = substr(hash('sha256', $expectedSecret), 0, 16);
 $rlDir = '/tmp/presign-rl';
-@mkdir($rlDir, 0755, true);
+if (!is_dir($rlDir) && !@mkdir($rlDir, 0755, true) && !is_dir($rlDir)) {
+    error_log("[presign] rid=$requestId rate limiter dir unavailable: $rlDir");
+    fail(503, 'rate limiter unavailable', $requestId);
+}
 $minuteBucket = intdiv(time(), 60);
 $rlFile = $rlDir . '/' . $secretHash . '.' . $minuteBucket;
 $fp = @fopen($rlFile, 'c+');
-if ($fp) {
-    if (flock($fp, LOCK_EX)) {
-        $count = (int)stream_get_contents($fp) + 1;
-        ftruncate($fp, 0);
-        rewind($fp);
-        fwrite($fp, (string)$count);
-        flock($fp, LOCK_UN);
-        fclose($fp);
-        if ($count > 300) fail(429, 'rate limit exceeded');
-    } else {
-        fclose($fp);
-    }
+if ($fp === false) {
+    error_log("[presign] rid=$requestId rate limiter fopen failed: $rlFile");
+    fail(503, 'rate limiter unavailable', $requestId);
 }
+if (!flock($fp, LOCK_EX)) {
+    fclose($fp);
+    error_log("[presign] rid=$requestId rate limiter flock failed");
+    fail(503, 'rate limiter unavailable', $requestId);
+}
+$count = (int)stream_get_contents($fp) + 1;
+ftruncate($fp, 0);
+rewind($fp);
+fwrite($fp, (string)$count);
+flock($fp, LOCK_UN);
+fclose($fp);
+if ($count > 300) fail(429, 'rate limit exceeded', $requestId);
 
 // ---- Config ----
 $region   = (string)($cfg['region']              ?? 'us-east-1');
@@ -108,21 +125,21 @@ $ttl      = (int)   ($cfg['presign_ttl_seconds'] ?? 900);
 $maxBytes = (int)   ($cfg['max_upload_bytes']    ?? 524288000);
 $pattern  = (string)($cfg['job_id_pattern']      ?? '/^C-\d{3}[A-Z0-9]{2}-\d{3}T?$/');
 
-if ($s3bucket === '' || $akid === '' || $secret === '') fail(500, 'server not configured');
+if ($s3bucket === '' || $akid === '' || $secret === '') fail(500, 'server not configured', $requestId);
 
 // ---- Validate input ----
 $jobId = trim((string)($_GET['job'] ?? ''));
 $filename = trim((string)($_GET['filename'] ?? ''));
 
-if ($jobId === '') fail(400, 'job is required');
-if (!preg_match($pattern, $jobId)) fail(400, 'invalid job_id');
+if ($jobId === '') fail(400, 'job is required', $requestId);
+if (!preg_match($pattern, $jobId)) fail(400, 'invalid job_id', $requestId);
 
-if ($filename === '') fail(400, 'filename is required');
-if (strlen($filename) > 255) fail(400, 'filename too long');
-if (preg_match('#[/\\\\]#', $filename)) fail(400, 'filename may not contain path separators');
-if (str_contains($filename, '..')) fail(400, 'filename may not contain ..');
-if (str_contains($filename, "\0")) fail(400, 'invalid filename');
-if (!preg_match('/^[A-Za-z0-9._\-() ]+$/', $filename)) fail(400, 'filename contains disallowed characters');
+if ($filename === '') fail(400, 'filename is required', $requestId);
+if (strlen($filename) > 255) fail(400, 'filename too long', $requestId);
+if (preg_match('#[/\\\\]#', $filename)) fail(400, 'filename may not contain path separators', $requestId);
+if (str_contains($filename, '..')) fail(400, 'filename may not contain ..', $requestId);
+if (str_contains($filename, "\0")) fail(400, 'invalid filename', $requestId);
+if (!preg_match('/^[A-Za-z0-9._\-() ]+$/', $filename)) fail(400, 'filename contains disallowed characters', $requestId);
 
 // ---- Mint presigned PUT URL ----
 try {
@@ -139,18 +156,23 @@ try {
     $req = $s3->createPresignedRequest($cmd, "+{$ttl} seconds");
     $uploadUrl = (string)$req->getUri();
 } catch (AwsException $e) {
-    fail(502, 'presign failed: ' . $e->getMessage());
+    error_log(sprintf("[presign] rid=%s aws error code=%s type=%s msg=%s",
+        $requestId, $e->getAwsErrorCode(), $e->getAwsErrorType(), $e->getMessage()));
+    fail(502, 'upstream error', $requestId);
 } catch (\Throwable $e) {
-    fail(500, 'presign failed: ' . $e->getMessage());
+    error_log(sprintf("[presign] rid=%s error class=%s msg=%s",
+        $requestId, get_class($e), $e->getMessage()));
+    fail(500, 'internal error', $requestId);
 }
 
-error_log(sprintf("[presign] ip=%s job=%s file=%s key=%s ttl=%d",
-    $_SERVER['REMOTE_ADDR'] ?? 'unknown', $jobId, $filename, $key, $ttl));
+error_log(sprintf("[presign] rid=%s ip=%s job=%s file=%s key=%s ttl=%d",
+    $requestId, $_SERVER['REMOTE_ADDR'] ?? 'unknown', $jobId, $filename, $key, $ttl));
 
 echo json_encode([
-    'uploadUrl' => $uploadUrl,
-    'expiresIn' => $ttl,
-    'key'       => $key,
-    'method'    => 'PUT',
-    'maxBytes'  => $maxBytes,
+    'uploadUrl'  => $uploadUrl,
+    'expiresIn'  => $ttl,
+    'key'        => $key,
+    'method'     => 'PUT',
+    'maxBytes'   => $maxBytes,
+    'request_id' => $requestId,
 ]);
