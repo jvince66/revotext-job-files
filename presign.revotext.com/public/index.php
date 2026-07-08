@@ -2,11 +2,15 @@
 /**
  * presign.revotext.com — S3 upload presign endpoint
  *
- * Called by https://assignments.revotext.com (reporter worksheet page).
- * Anonymous — validates job_id pattern + rate limits per IP.
+ * Server-to-server. Coworker's server (assignments.revotext.com backend) calls this
+ * after authenticating the reporter. Reporter's browser never talks to us directly.
  *
- * Request:  GET /?job=C-60716-002&filename=worksheet.pdf
- * Response: {"uploadUrl":"https://...","expiresIn":900,"key":"jobs/.../","method":"PUT","maxBytes":524288000}
+ * Request:
+ *   GET /?job=C-60716-002&filename=worksheet.pdf
+ *   Authorization: Bearer <shared-secret>
+ *
+ * Response:
+ *   {"uploadUrl":"https://...","expiresIn":900,"key":"jobs/.../","method":"PUT","maxBytes":524288000}
  */
 declare(strict_types=1);
 
@@ -23,14 +27,14 @@ if (!is_array($cfg)) {
     exit;
 }
 
-// ---- CORS ----
+// ---- CORS (still supported in case a browser fallback is ever needed) ----
 $allowedOrigin = (string)($cfg['allowed_origin'] ?? '');
 $origin = $_SERVER['HTTP_ORIGIN'] ?? '';
 if ($origin === $allowedOrigin && $allowedOrigin !== '') {
     header("Access-Control-Allow-Origin: $allowedOrigin");
     header('Vary: Origin');
     header('Access-Control-Allow-Methods: GET, OPTIONS');
-    header('Access-Control-Allow-Headers: Content-Type');
+    header('Access-Control-Allow-Headers: Content-Type, Authorization');
     header('Access-Control-Max-Age: 3600');
 }
 
@@ -49,12 +53,36 @@ function fail(int $code, string $msg): void {
     exit;
 }
 
-// ---- Rate limit: 60 requests/min per IP ----
-$ip = $_SERVER['REMOTE_ADDR'] ?? 'unknown';
+// ---- Bearer token auth (shared secret) ----
+function get_bearer_token(): ?string {
+    $hdr = '';
+    if (function_exists('getallheaders')) {
+        foreach (getallheaders() as $k => $v) {
+            if (strcasecmp($k, 'Authorization') === 0) { $hdr = (string)$v; break; }
+        }
+    }
+    if (!$hdr && isset($_SERVER['HTTP_AUTHORIZATION']))          $hdr = (string)$_SERVER['HTTP_AUTHORIZATION'];
+    if (!$hdr && isset($_SERVER['REDIRECT_HTTP_AUTHORIZATION'])) $hdr = (string)$_SERVER['REDIRECT_HTTP_AUTHORIZATION'];
+    if (!$hdr) return null;
+    if (!preg_match('/^Bearer\s+(.+)$/i', trim($hdr), $m)) return null;
+    return trim($m[1]);
+}
+
+$expectedSecret = (string)($cfg['endpoint_secret'] ?? '');
+if ($expectedSecret === '' || strlen($expectedSecret) < 32) fail(500, 'server not configured');
+
+$token = get_bearer_token();
+if ($token === null || !hash_equals($expectedSecret, $token)) {
+    error_log(sprintf("[presign] unauthorized from ip=%s ua=%s", $_SERVER['REMOTE_ADDR'] ?? '?', $_SERVER['HTTP_USER_AGENT'] ?? '?'));
+    fail(401, 'unauthorized');
+}
+
+// ---- Rate limit: 300/min global (keyed by secret hash, not IP) ----
+$secretHash = substr(hash('sha256', $expectedSecret), 0, 16);
 $rlDir = '/tmp/presign-rl';
 @mkdir($rlDir, 0755, true);
 $minuteBucket = intdiv(time(), 60);
-$rlFile = $rlDir . '/' . sha1($ip) . '.' . $minuteBucket;
+$rlFile = $rlDir . '/' . $secretHash . '.' . $minuteBucket;
 $fp = @fopen($rlFile, 'c+');
 if ($fp) {
     if (flock($fp, LOCK_EX)) {
@@ -64,21 +92,21 @@ if ($fp) {
         fwrite($fp, (string)$count);
         flock($fp, LOCK_UN);
         fclose($fp);
-        if ($count > 60) fail(429, 'rate limit exceeded');
+        if ($count > 300) fail(429, 'rate limit exceeded');
     } else {
         fclose($fp);
     }
 }
 
 // ---- Config ----
-$region   = (string)($cfg['region']            ?? 'us-east-1');
-$s3bucket = (string)($cfg['bucket']            ?? 'revotext-portal-documents');
-$prefix   = (string)($cfg['prefix']            ?? 'jobs/');
-$akid     = (string)($cfg['access_key_id']     ?? '');
-$secret   = (string)($cfg['secret_access_key'] ?? '');
+$region   = (string)($cfg['region']              ?? 'us-east-1');
+$s3bucket = (string)($cfg['bucket']              ?? 'revotext-portal-documents');
+$prefix   = (string)($cfg['prefix']              ?? 'jobs/');
+$akid     = (string)($cfg['access_key_id']       ?? '');
+$secret   = (string)($cfg['secret_access_key']   ?? '');
 $ttl      = (int)   ($cfg['presign_ttl_seconds'] ?? 900);
 $maxBytes = (int)   ($cfg['max_upload_bytes']    ?? 524288000);
-$pattern  = (string)($cfg['job_id_pattern']    ?? '/^C-\d{3}[A-Z0-9]{2}-\d{3}T?$/');
+$pattern  = (string)($cfg['job_id_pattern']      ?? '/^C-\d{3}[A-Z0-9]{2}-\d{3}T?$/');
 
 if ($s3bucket === '' || $akid === '' || $secret === '') fail(500, 'server not configured');
 
@@ -116,7 +144,8 @@ try {
     fail(500, 'presign failed: ' . $e->getMessage());
 }
 
-error_log(sprintf("[presign] ip=%s job=%s file=%s key=%s ttl=%d", $ip, $jobId, $filename, $key, $ttl));
+error_log(sprintf("[presign] ip=%s job=%s file=%s key=%s ttl=%d",
+    $_SERVER['REMOTE_ADDR'] ?? 'unknown', $jobId, $filename, $key, $ttl));
 
 echo json_encode([
     'uploadUrl' => $uploadUrl,

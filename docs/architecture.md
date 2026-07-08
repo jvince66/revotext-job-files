@@ -1,36 +1,46 @@
 # Architecture notes
 
-Two services, one bucket, two flows.
+Two services, one bucket, two flows. **Bucket versioning is enabled** — overwritten keys retain prior versions.
 
-## Upload flow (presign.revotext.com)
+## Upload flow (presign.revotext.com) — server-to-server
 
 ```
-Reporter's browser                       presign.revotext.com                    S3
-     │                                          │                                 │
-     │  Click Upload on worksheet card          │                                 │
-     │  GET /?job=C-60716-002&filename=X.pdf    │                                 │
-     │─────────────────────────────────────────▶│                                 │
-     │                                          │  Validate job_id regex          │
-     │                                          │  Validate filename              │
-     │                                          │  Rate-limit check (60/min/IP)   │
-     │                                          │  Mint presigned PUT URL         │
-     │  200 {uploadUrl, expiresIn, key, ...}    │  (via AWS SDK for PHP)          │
-     │◀─────────────────────────────────────────│                                 │
-     │                                          │                                 │
-     │  PUT uploadUrl                           │                                 │
-     │  Body: file bytes                        │                                 │
-     │──────────────────────────────────────────┼────────────────────────────────▶│
-     │                                          │                                 │  Object created:
-     │                                          │                                 │  jobs/C-60716-002/X.pdf
-     │  200 OK                                  │                                 │
-     │◀─────────────────────────────────────────┼─────────────────────────────────│
+Reporter's browser         Coworker's backend         presign.revotext.com               S3
+  (assignments.revotext.com)  (their server)
+        │                          │                          │                            │
+        │  Click Upload            │                          │                            │
+        │  POST /file+worksheet    │                          │                            │
+        │─────────────────────────▶│                          │                            │
+        │                          │  Authenticate reporter   │                            │
+        │                          │                          │                            │
+        │                          │  GET /?job=X&filename=Y  │                            │
+        │                          │  Authorization: Bearer   │                            │
+        │                          │     <shared-secret>      │                            │
+        │                          │─────────────────────────▶│                            │
+        │                          │                          │  Validate bearer token     │
+        │                          │                          │  Validate job_id regex     │
+        │                          │                          │  Validate filename         │
+        │                          │                          │  Rate-limit (300/min)      │
+        │                          │                          │  Mint presigned PUT URL    │
+        │                          │  200 {uploadUrl, ...}    │                            │
+        │                          │◀─────────────────────────│                            │
+        │                          │                          │                            │
+        │                          │  (Either their backend or the reporter's browser      │
+        │                          │   PUTs the file to uploadUrl — decided on their side) │
+        │                          │─── PUT uploadUrl ────────┼────────────────────────────▶│
+        │                          │                          │                            │  Object created:
+        │                          │                          │                            │  jobs/X/Y
+        │                          │                          │                            │
+        │                          │  200 OK                  │                            │
+        │◀─────────────────────────│◀─── 200 OK ──────────────┼────────────────────────────│
 ```
 
-- Presigned URL lifetime: 15 minutes
-- S3 bucket CORS allows PUT from `https://assignments.revotext.com` only (the reporter's worksheet origin)
-- Content-length cap: 500 MB per file (enforced by the client-side upload code; not signed into the URL itself in this build)
+- Shared-secret bearer token required on every presign call
+- Presigned URL: PUT only, 15-min TTL
+- Rate limit: 300 requests/minute global (keyed by secret hash — makes it per-caller since only one caller exists today)
+- S3 bucket CORS still allows browser PUT from `https://assignments.revotext.com` in case they route uploads through the reporter's browser rather than their backend
 
-## Read flow (files.revotext.com)
+## Read flow (files.revotext.com) — browser + M365 SSO
 
 ```
 Office staff browser                     files.revotext.com                       S3
@@ -51,12 +61,9 @@ Office staff browser                     files.revotext.com                     
      │                                          │  S3 listObjectsV2               │
      │                                          │────────────────────────────────▶│
      │                                          │◀────────────────────────────────│
-     │                                          │  For each object, mint          │
-     │                                          │  presigned GET URL (15 min)     │
+     │                                          │  Mint presigned GET URLs (15m)  │
      │  200 {files: [...], viewer: {...}, ...}  │                                 │
      │◀─────────────────────────────────────────│                                 │
-     │                                          │                                 │
-     │  Render HTML table with download links   │                                 │
      │                                          │                                 │
      │  Click filename → GET presigned_url      │                                 │
      │──────────────────────────────────────────┼────────────────────────────────▶│
@@ -64,23 +71,22 @@ Office staff browser                     files.revotext.com                     
      │◀─────────────────────────────────────────┼─────────────────────────────────│
 ```
 
-- Office read is fully gated by M365 SSO (same tenant + allowlist as `support.revotext.com`)
-- Download links are per-request short-lived — each click on a filename mints a fresh 15-min URL server-side
-- Office side has **no delete or upload permission**; only read
-
 ## Shared components on the Lightsail server
 
-- `/var/www/files.revotext.com/vendor-root/vendor/` — AWS SDK for PHP. `presign.revotext.com` uses this same installation via absolute `require_once` path
-- `/var/www/html/api/auth-helper.php` — M365 token validation + allowlist check (owned by the support portal repo; `files.revotext.com/api/auth-helper.php` is a symlink to this)
-- `/var/www/html/api/users.json` — the allowlist (owned by the support portal). Add or remove office staff there and both apps see the change
+- `/var/www/files.revotext.com/vendor-root/vendor/` — AWS SDK for PHP. `presign.revotext.com` uses this via absolute `require_once`.
+- `/var/www/html/api/auth-helper.php` — M365 token validation + allowlist check. `files.revotext.com/api/auth-helper.php` is a symlink to this so the two apps stay in sync.
+- `/var/www/html/api/users.json` — the M365 email allowlist (owned by the support portal). Both apps read it via the symlink.
+- `/root/migration-secrets/presign_endpoint_secret` — the shared bearer secret (root-only readable; shared with the caller out-of-band).
 
-## Why no HMAC on presign
+## Why shared-secret bearer auth?
 
-The reporter's browser calls `presign.revotext.com` directly. Any shared secret would be visible in DevTools, so HMAC would provide zero real defense. Instead we rely on:
+The endpoint used to be anonymous with per-IP rate limiting when it was called directly from the reporter's browser. That model has known limitations: anyone who knows a valid Job ID can mint upload URLs, and only rate-limiting stands between us and abuse.
 
-- **Job ID regex + filename sanitization** (blocks garbage input)
-- **Rate limit** (blocks brute-force)
-- **CORS** (blocks direct calls from other origins in a browser context)
-- **Short-lived, single-key presigned URLs** (blocks reuse / forwarding)
+The current design routes the presign call server-to-server: `assignments.revotext.com`'s backend authenticates the reporter (their own auth), then calls our endpoint with a shared secret. Reporters never call us directly. Benefits:
 
-For a stronger posture (SOC 2 leaning), the coworker's platform would call our endpoint server-to-server with HMAC, and hand the URL to the reporter's browser. Not implemented in this build — see conversation history if you want to revisit.
+- **Real authentication.** The bearer secret is never exposed to any browser.
+- **Better rate-limit granularity.** All legitimate traffic comes from a single caller, so a global cap makes sense.
+- **Cleaner audit trail.** Every presign issuance is attributable to the caller.
+- **SOC 2 friendly.** Auditors accept HMAC/bearer between servers as a genuine access control.
+
+The bucket CORS rule and the file-upload path from browser to S3 stays in place so the coworker's design decision (their backend proxying vs. their browser uploading) doesn't force a code change on our side.

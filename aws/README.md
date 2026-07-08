@@ -2,6 +2,12 @@
 
 Bucket: `revotext-portal-documents` (us-east-1, account 895306629228).
 
+## Bucket versioning
+
+**Enabled.** Every overwrite of an existing key preserves the prior version. If a reporter re-uploads a file with the same name, the earlier version is retained and can be recovered via the S3 console or CLI. Also protects against accidental deletion (though our IAM policies already disallow delete for both users).
+
+Lifecycle policy for non-current versions: not currently set. Consider adding a rule to expire non-current versions after N days if storage cost becomes a concern.
+
 ## IAM users
 
 | User | Attached policy | Consumer |
@@ -18,8 +24,9 @@ Neither user can delete objects. Delete via AWS console when needed.
 
 ## S3 bucket CORS
 
-- `s3-bucket-cors.json` — Applied to the bucket via **S3 → Permissions → Cross-origin resource sharing**. Allows browser PUT from `https://assignments.revotext.com` only. Without this, browser-side uploads from the reporter's worksheet card would be blocked.
+- `s3-bucket-cors.json` — Applied via **S3 → Permissions → Cross-origin resource sharing**. Allows browser PUT from `https://assignments.revotext.com`. Still applied for defense-in-depth even though the current design routes uploads through the coworker's backend.
 
-## Rotation
+## Rotations
 
-Rotate both IAM users' access keys every 90 days. Update the corresponding `aws-config.json` on the Lightsail server. No downtime — the new key becomes live the moment the JSON is saved (PHP re-reads on each request).
+- **IAM access keys** — every 90 days. Update `aws-config.json` on Lightsail. No downtime.
+- **`presign.revotext.com` endpoint_secret** — every 90 days. See `presign.revotext.com/README.md` for the rotation procedure.
